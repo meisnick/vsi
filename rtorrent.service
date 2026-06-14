@@ -1,0 +1,14 @@
+[Unit]
+Description=rTorrent
+After=network.target
+
+[Service]
+User=__USERNAME__
+Type=forking
+KillMode=mixed
+ExecStart=/usr/bin/screen -dmS rtorrent /usr/local/bin/rtorrent
+ExecStop=/usr/bin/screen -S rtorrent -X quit
+WorkingDirectory=/home/__USERNAME__
+
+[Install]
+WantedBy=multi-user.target

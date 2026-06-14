@@ -1,0 +1,60 @@
+# Vanilla Seedbox — Nginx site
+# Access model: public, protected by HTTP Basic Auth (+ Fail2ban nginx-http-auth jail).
+# Only /rutorrent is served; everything else returns 404.
+
+# --- HTTP: redirect everything to HTTPS ---
+server {
+        listen 80;
+        listen [::]:80;
+        server_name _;
+
+        # Certbot inserts its ACME challenge handling above this redirect.
+        location / {
+                return 301 https://$host$request_uri;
+        }
+}
+
+# --- HTTPS ---
+server {
+        listen 443 ssl http2 default_server;
+        listen [::]:443 ssl http2 default_server;
+
+        server_name _;
+        access_log /var/log/nginx/rutorrent-access.log;
+
+        root /var/www;
+        index index.php index.html index.htm;
+
+        client_max_body_size 40m;
+
+        # Self-signed by default; replaced with Let's Encrypt by setup.sh Stage 10.
+        ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
+        ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+        ssl_session_timeout 5m;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_prefer_server_ciphers on;
+
+        # Security headers
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "no-referrer" always;
+
+        # Do not expose anything outside the app.
+        location / {
+                return 404;
+        }
+
+        location /rutorrent {
+                auth_basic "Restricted";
+                auth_basic_user_file /etc/nginx/.htpasswd;
+                include /etc/nginx/conf.d/php;
+                include /etc/nginx/conf.d/cache;
+        }
+
+        #include /etc/nginx/sites-available/dload-loc;
+
+        location ~ /\.ht {
+                deny all;
+        }
+}
