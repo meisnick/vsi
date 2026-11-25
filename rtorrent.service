@@ -1,14 +1,31 @@
 [Unit]
 Description=rTorrent
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 User=__USERNAME__
 Type=forking
 KillMode=mixed
+# A lock left by the previous boot names a PID that may now belong to another
+# process, making rTorrent exit immediately. systemd guarantees one instance.
+ExecStartPre=/bin/rm -f /home/__USERNAME__/rtorrent/.session/rtorrent.lock
+# A socket file left by an unclean exit makes network.scgi.open_local fail.
+ExecStartPre=/bin/rm -f /home/__USERNAME__/rtorrent/.rtorrent.sock
 ExecStart=/usr/bin/screen -dmS rtorrent /usr/local/bin/rtorrent
-ExecStop=/usr/bin/screen -S rtorrent -X quit
+# Ask rTorrent (screen's only child) to shut down cleanly: SIGINT saves the session
+# and announces 'stopped' to trackers. Matched by parent PID, not by name, because
+# the process name changed between versions ('rtorrent main' -> 'rtorrent-main').
+ExecStop=/bin/sh -c 'pkill -INT -P $MAINPID; while pgrep -P $MAINPID >/dev/null; do sleep 1; done'
+TimeoutStopSec=150
 WorkingDirectory=/home/__USERNAME__
+# limits.conf does not apply to systemd services; rtorrent.rc allows up to
+# 1536 sockets plus open files, well above the default soft limit of 1024.
+LimitNOFILE=32768
+# The tracked main process is screen, which exits 0 even when rTorrent
+# crashes, so on-failure would never fire. `systemctl stop` still stops it.
+Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target

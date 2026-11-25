@@ -5,6 +5,7 @@
     delaycompress
     missingok
     notifempty
+    su root syslog
     create 0644 root root
 }
 
@@ -15,6 +16,7 @@
     delaycompress
     missingok
     notifempty
+    su root syslog
     create 0644 root root
 }
 
@@ -25,6 +27,7 @@
     delaycompress
     missingok
     notifempty
+    su root syslog
     create 0644 root root
 }
 
@@ -35,6 +38,7 @@
     delaycompress
     missingok
     notifempty
+    su root syslog
     create 0644 root root
 }
 
@@ -45,6 +49,7 @@
     delaycompress
     missingok
     notifempty
+    su root syslog
     create 0644 root root
 }
 
@@ -55,5 +60,6 @@
     delaycompress
     missingok
     notifempty
+    su root syslog
     create 0644 root root
 }

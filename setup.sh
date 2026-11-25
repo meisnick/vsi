@@ -25,6 +25,53 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Resolve the repository directory so templates are found no matter where the
+# script is invoked from (Stage 2 cd's into the source trees).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Persistent installer state (ports, domain) so re-runs keep existing settings
+STATE_FILE="/etc/vsi.conf"
+PREV_SSH_PORT=""
+PREV_FTP_PORT=""
+PREV_DOMAIN=""
+PREV_EMAIL=""
+if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    PREV_SSH_PORT="${VSI_SSH_PORT:-}"
+    PREV_FTP_PORT="${VSI_FTP_PORT:-}"
+    PREV_DOMAIN="${VSI_DOMAIN:-}"
+    PREV_EMAIL="${VSI_EMAIL:-}"
+fi
+
+save_state() {
+    cat > "$STATE_FILE" << EOF
+# Vanilla Seedbox installer state — read by setup.sh on re-runs
+VSI_USER="$USERNAME"
+VSI_SSH_PORT="$SSH_PORT"
+VSI_FTP_PORT="$FTP_PORT"
+VSI_DOMAIN="${DOMAIN_NAME:-$PREV_DOMAIN}"
+VSI_EMAIL="${EMAIL_ADDR:-$PREV_EMAIL}"
+EOF
+    chmod 600 "$STATE_FILE"
+}
+
+# Detect the SSH port sshd is actually configured with (honours sshd_config.d)
+detect_ssh_port() {
+    local p
+    mkdir -p /run/sshd  # sshd -T/-t need it; absent when ssh.socket hasn't spawned sshd
+    p=$(sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}' || true)
+    if [ -z "$p" ]; then
+        p=$(grep -E "^Port " /etc/ssh/sshd_config | awk '{print $2}' | head -n1 || true)
+    fi
+    echo "${p:-22}"
+}
+
+ufw_active() {
+    command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"
+}
+
 # Detect OS version
 if [ -f /etc/os-release ]; then
     . /etc/os-release
@@ -53,16 +100,38 @@ USER_HOME="/home/$USERNAME"
 SOURCE_DIR="$USER_HOME/source"
 RTORRENT_DIR="$USER_HOME/rtorrent"
 
-# Pinned upstream source commits (verified after checkout for supply-chain safety)
-LIBTORRENT_SHA="ee92e30316095c8a9a01372c60d48cf84f11a0e2"  # tag v0.15.7
-RTORRENT_SHA="d3ecc83b328b15351e673ada14a7573c482f3363"   # tag v0.15.7
+# Pinned upstream sources (verified after checkout for supply-chain safety)
+XMLRPC_REV="3344"                                           # svn stable r3344 = xmlrpc-c 1.67.02
+LIBTORRENT_SHA="392030e0fddbe4e423d059d9322382cf44aaaaf6"  # tag v0.16.28
+RTORRENT_SHA="0c23d278a7838402d4cec9689bf71e051332be67"   # tag v0.16.28
+RUTORRENT_TAG="v5.3.25"
+RUTORRENT_SHA="91f966a01bc35a25598ce7f024855625113b31d7"  # tag v5.3.25
+JOBS="$(nproc 2>/dev/null || echo 1)"
 
 # SSH and FTP port randomization
 SSH_PORT=22
 FTP_PORT=47260
+RANDOMIZE_PORTS=N
 
-read -p "Do you want to randomize SSH and FTP listening ports for security? [Y/n]: " RANDOMIZE_PORTS
-RANDOMIZE_PORTS=${RANDOMIZE_PORTS:-Y}
+if [ -n "$PREV_SSH_PORT" ] && [ -n "$PREV_FTP_PORT" ]; then
+    # Re-run: keep the ports chosen last time unless explicitly asked to change
+    echo -e "${CYAN}Previous install detected ($STATE_FILE): SSH Port = $PREV_SSH_PORT, FTP Port = $PREV_FTP_PORT${RESET}"
+    read -p "Keep these ports? [Y/n]: " KEEP_PORTS
+    KEEP_PORTS=${KEEP_PORTS:-Y}
+    if [[ "$KEEP_PORTS" =~ ^[Yy]$ ]]; then
+        SSH_PORT="$PREV_SSH_PORT"
+        FTP_PORT="$PREV_FTP_PORT"
+    else
+        read -p "Randomize new SSH and FTP ports? [y/N]: " RANDOMIZE_PORTS
+        RANDOMIZE_PORTS=${RANDOMIZE_PORTS:-N}
+        SSH_PORT=$(detect_ssh_port)
+        FTP_PORT="$PREV_FTP_PORT"
+    fi
+else
+    read -p "Do you want to randomize SSH and FTP listening ports for security? [Y/n]: " RANDOMIZE_PORTS
+    RANDOMIZE_PORTS=${RANDOMIZE_PORTS:-Y}
+    SSH_PORT=$(detect_ssh_port)
+fi
 
 if [[ "$RANDOMIZE_PORTS" =~ ^[Yy]$ ]]; then
     # Generate random ports between 10000 and 30000
@@ -74,13 +143,20 @@ if [[ "$RANDOMIZE_PORTS" =~ ^[Yy]$ ]]; then
     done
     echo -e "${GREEN}✓ Randomized ports selected: SSH Port = $SSH_PORT, FTP Port = $FTP_PORT${RESET}"
 else
-    # Detect current SSH port
-    CURRENT_SSH=$(grep -E "^Port " /etc/ssh/sshd_config | awk '{print $2}' || true)
-    if [ -z "$CURRENT_SSH" ]; then
-        CURRENT_SSH=$(ss -tlnp | grep -E "sshd|systemd" | grep -v "127.0.0.1" | awk '{print $4}' | awk -F: '{print $NF}' | sort -u | head -n1 || true)
-    fi
-    SSH_PORT=${CURRENT_SSH:-22}
     echo -e "Using default/existing ports: SSH Port = $SSH_PORT, FTP Port = $FTP_PORT"
+fi
+
+# Warn loudly before an SSH port change — a provider/cloud firewall that only
+# allows the old port will lock you out of new sessions.
+ACTIVE_SSH_PORT=$(detect_ssh_port)
+if [ "$SSH_PORT" != "$ACTIVE_SSH_PORT" ]; then
+    echo -e "${RED}WARNING: SSH will move from port $ACTIVE_SSH_PORT to port $SSH_PORT.${RESET}"
+    echo -e "${YELLOW}If your hosting provider has an external firewall/security group, open TCP $SSH_PORT there FIRST.${RESET}"
+    read -p "Type the new SSH port ($SSH_PORT) to confirm, or press Enter to keep port $ACTIVE_SSH_PORT: " CONFIRM_SSH_PORT
+    if [ "$CONFIRM_SSH_PORT" != "$SSH_PORT" ]; then
+        SSH_PORT="$ACTIVE_SSH_PORT"
+        echo -e "Keeping SSH on port $SSH_PORT."
+    fi
 fi
 
 echo -e "${CYAN}Configuring stack for user: $USERNAME (Home: $USER_HOME)${RESET}"
@@ -93,10 +169,19 @@ apt-get update
 
 # Install build tools, screen, git, vsftpd, and library dependencies
 apt-get install -y build-essential autoconf libtool pkg-config git subversion \
-    curl screen vsftpd libssl-dev libcurl4-openssl-dev libncurses5-dev libxml2-dev ufw
+    curl screen vsftpd libssl-dev libcurl4-openssl-dev libncurses5-dev libxml2-dev ufw \
+    ssl-cert
+
+# Self-signed fallback cert used by nginx and vsftpd until Let's Encrypt is configured
+if [ ! -f /etc/ssl/certs/ssl-cert-snakeoil.pem ] || [ ! -f /etc/ssl/private/ssl-cert-snakeoil.key ]; then
+    make-ssl-cert generate-default-snakeoil --force-overwrite
+fi
 
 # Install Nginx and PHP 8.3 FPM stack
-apt-get install -y nginx php8.3-fpm php8.3-cli php8.3-bcmath php8.3-xml php-pear php-common pkg-php-tools
+# ruTorrent 5.3+ checks PHP extensions at load and disables plugins whose
+# extension is missing (mbstring: _getdir/xmpp/create; curl: telegram; zip: source)
+apt-get install -y nginx php8.3-fpm php8.3-cli php8.3-bcmath php8.3-xml php8.3-mbstring \
+    php8.3-curl php8.3-zip php-pear php-common pkg-php-tools
 
 # ==============================================================================
 #  2. COMPILE XMLRPC-C, LIBTORRENT, & RTORRENT FROM SOURCE
@@ -105,58 +190,71 @@ echo -e "\n${CYAN}[2/10] Compiling core binaries from source...${RESET}"
 mkdir -p "$SOURCE_DIR"
 chown -R "$USERNAME:$USERNAME" "$SOURCE_DIR"
 
-# A. Compile XMLRPC-C
+# Source trees are owned by $USERNAME but git runs as root here; mark them safe
+# so git's ownership check doesn't abort the build ("dubious ownership").
+GIT_SAFE=(-c "safe.directory=$SOURCE_DIR/libtorrent-git" -c "safe.directory=$SOURCE_DIR/rtorrent-git")
+
+# A. Compile XMLRPC-C (pinned svn revision)
 if [ ! -d "$SOURCE_DIR/xmlrpc" ]; then
-    echo -e "${YELLOW}Checking out xmlrpc-c stable source...${RESET}"
-    svn checkout https://svn.code.sf.net/p/xmlrpc-c/code/stable "$SOURCE_DIR/xmlrpc"
-    chown -R "$USERNAME:$USERNAME" "$SOURCE_DIR/xmlrpc"
+    echo -e "${YELLOW}Checking out xmlrpc-c stable source (r$XMLRPC_REV)...${RESET}"
+    svn checkout -r "$XMLRPC_REV" https://svn.code.sf.net/p/xmlrpc-c/code/stable "$SOURCE_DIR/xmlrpc"
+else
+    svn update -r "$XMLRPC_REV" "$SOURCE_DIR/xmlrpc"
 fi
-echo -e "${YELLOW}Building xmlrpc-c...${RESET}"
+chown -R "$USERNAME:$USERNAME" "$SOURCE_DIR/xmlrpc"
+if [ "$(svn info --show-item revision "$SOURCE_DIR/xmlrpc")" != "$XMLRPC_REV" ]; then
+    echo -e "${RED}Error: xmlrpc-c checkout does not match pinned revision r$XMLRPC_REV. Aborting.${RESET}"
+    exit 1
+fi
+echo -e "${YELLOW}Building xmlrpc-c (pinned r$XMLRPC_REV)...${RESET}"
 cd "$SOURCE_DIR/xmlrpc"
 ./configure
-make
+make -j"$JOBS"
 make install
 
-# B. Compile Libtorrent (version 0.15.7)
+# B. Compile Libtorrent (version 0.16.28)
 if [ ! -d "$SOURCE_DIR/libtorrent-git" ]; then
     echo -e "${YELLOW}Cloning libtorrent git repository...${RESET}"
     git clone https://github.com/rakshasa/libtorrent.git "$SOURCE_DIR/libtorrent-git"
     chown -R "$USERNAME:$USERNAME" "$SOURCE_DIR/libtorrent-git"
 fi
-echo -e "${YELLOW}Building libtorrent (pinned v0.15.7 / $LIBTORRENT_SHA)...${RESET}"
+echo -e "${YELLOW}Building libtorrent (pinned v0.16.28 / $LIBTORRENT_SHA)...${RESET}"
 cd "$SOURCE_DIR/libtorrent-git"
-git fetch --tags origin
-git checkout "$LIBTORRENT_SHA"
-if [ "$(git rev-parse HEAD)" != "$LIBTORRENT_SHA" ]; then
+git "${GIT_SAFE[@]}" fetch --tags origin
+git "${GIT_SAFE[@]}" checkout "$LIBTORRENT_SHA"
+if [ "$(git "${GIT_SAFE[@]}" rev-parse HEAD)" != "$LIBTORRENT_SHA" ]; then
     echo -e "${RED}Error: libtorrent checkout does not match pinned commit $LIBTORRENT_SHA. Aborting.${RESET}"
     exit 1
 fi
-./autogen.sh
+autoreconf -ivf   # 0.16 tags ship no autogen.sh
 ./configure
-make
+make -j"$JOBS"
 make install
 
-# C. Compile rTorrent (version 0.15.7)
+# C. Compile rTorrent (version 0.16.28)
 if [ ! -d "$SOURCE_DIR/rtorrent-git" ]; then
     echo -e "${YELLOW}Cloning rtorrent git repository...${RESET}"
     git clone https://github.com/rakshasa/rtorrent.git "$SOURCE_DIR/rtorrent-git"
     chown -R "$USERNAME:$USERNAME" "$SOURCE_DIR/rtorrent-git"
 fi
-echo -e "${YELLOW}Building rtorrent (pinned v0.15.7 / $RTORRENT_SHA) with xmlrpc-c...${RESET}"
+echo -e "${YELLOW}Building rtorrent (pinned v0.16.28 / $RTORRENT_SHA) with xmlrpc-c...${RESET}"
 cd "$SOURCE_DIR/rtorrent-git"
-git fetch --tags origin
-git checkout "$RTORRENT_SHA"
-if [ "$(git rev-parse HEAD)" != "$RTORRENT_SHA" ]; then
+git "${GIT_SAFE[@]}" fetch --tags origin
+git "${GIT_SAFE[@]}" checkout "$RTORRENT_SHA"
+if [ "$(git "${GIT_SAFE[@]}" rev-parse HEAD)" != "$RTORRENT_SHA" ]; then
     echo -e "${RED}Error: rtorrent checkout does not match pinned commit $RTORRENT_SHA. Aborting.${RESET}"
     exit 1
 fi
-./autogen.sh
+autoreconf -ivf   # 0.16 tags ship no autogen.sh
 ./configure --with-xmlrpc-c
-make
+make -j"$JOBS"
 make install
 
 # Reload shared library cache
 ldconfig
+
+# Return to the repository so the templates below resolve correctly
+cd "$SCRIPT_DIR"
 
 # ==============================================================================
 #  3. CONFIGURE RTORRENT FOR USER
@@ -164,8 +262,17 @@ ldconfig
 echo -e "\n${CYAN}[3/10] Setting up rTorrent directories and config...${RESET}"
 mkdir -p "$RTORRENT_DIR/download" "$RTORRENT_DIR/watch" "$RTORRENT_DIR/.session"
 
+# rTorrent writes its execute/event log here (see rtorrent.rc); it refuses to
+# start if the directory is missing or not writable by the rTorrent user.
+mkdir -p /var/log/rtorrent
+chown "$USERNAME:$USERNAME" /var/log/rtorrent
+chmod 755 /var/log/rtorrent
+
 # Copy rtorrent.rc config template and replace username placeholder
 if [ -f rtorrent.rc ]; then
+    if [ -f "$USER_HOME/.rtorrent.rc" ]; then
+        cp "$USER_HOME/.rtorrent.rc" "$USER_HOME/.rtorrent.rc.bak.$(date +%Y%m%d%H%M%S)"
+    fi
     cp rtorrent.rc "$USER_HOME/.rtorrent.rc"
     sed -i "s/__USERNAME__/$USERNAME/g" "$USER_HOME/.rtorrent.rc"
 else
@@ -187,9 +294,23 @@ chmod g+x "$USER_HOME"
 echo -e "\n${CYAN}[4/10] Installing ruTorrent web interface...${RESET}"
 mkdir -p /var/www
 
+RUT_GIT=(git -c "safe.directory=/var/www/rutorrent" -C /var/www/rutorrent)
 if [ ! -d /var/www/rutorrent ]; then
-    echo -e "${YELLOW}Cloning ruTorrent v5.2.10...${RESET}"
-    git clone --branch v5.2.10 https://github.com/Novik/ruTorrent.git /var/www/rutorrent
+    echo -e "${YELLOW}Cloning ruTorrent $RUTORRENT_TAG...${RESET}"
+    git clone --branch "$RUTORRENT_TAG" https://github.com/Novik/ruTorrent.git /var/www/rutorrent
+elif [ -d /var/www/rutorrent/.git ] && [ "$("${RUT_GIT[@]}" rev-parse HEAD)" != "$RUTORRENT_SHA" ]; then
+    # Upgrade an earlier install in place. conf/config.php is tracked and was
+    # edited below on the previous run, so keep a copy and let the edits below
+    # re-apply to the new upstream file; conf/users/ and share/ are untracked
+    # and survive the checkout.
+    echo -e "${YELLOW}Upgrading ruTorrent to $RUTORRENT_TAG...${RESET}"
+    cp -a /var/www/rutorrent/conf/config.php "/var/www/rutorrent/conf/config.php.bak.$(date +%Y%m%d%H%M%S)"
+    "${RUT_GIT[@]}" fetch --tags origin
+    "${RUT_GIT[@]}" checkout -f "$RUTORRENT_SHA"
+fi
+if [ -d /var/www/rutorrent/.git ] && [ "$("${RUT_GIT[@]}" rev-parse HEAD)" != "$RUTORRENT_SHA" ]; then
+    echo -e "${RED}Error: ruTorrent checkout does not match pinned commit $RUTORRENT_SHA. Aborting.${RESET}"
+    exit 1
 fi
 
 # Create default basic auth htpasswd if not exists
@@ -228,10 +349,31 @@ echo -e "\n${CYAN}[5/10] Deploying Nginx, PHP, and system configurations...${RES
 [ -f nginx-conf-cache ] && cp nginx-conf-cache /etc/nginx/conf.d/cache
 [ -f nginx-conf-php ] && cp nginx-conf-php /etc/nginx/conf.d/php
 
-if [ -f nginx-site-default ]; then
-    cp nginx-site-default /etc/nginx/sites-available/default
-    sed -i "s/auth_basic_user_file.*/auth_basic_user_file \/etc\/nginx\/.htpasswd;/g" /etc/nginx/sites-available/default
+# TLS certificate shared by nginx and vsftpd: self-signed by default, or the
+# Let's Encrypt cert from a previous run so re-running doesn't revert to snakeoil.
+TLS_CERT="/etc/ssl/certs/ssl-cert-snakeoil.pem"
+TLS_KEY="/etc/ssl/private/ssl-cert-snakeoil.key"
+TLS_DOMAIN=""
+if [ -n "$PREV_DOMAIN" ] && [ -f "/etc/letsencrypt/live/$PREV_DOMAIN/fullchain.pem" ]; then
+    TLS_DOMAIN="$PREV_DOMAIN"
+    TLS_CERT="/etc/letsencrypt/live/$PREV_DOMAIN/fullchain.pem"
+    TLS_KEY="/etc/letsencrypt/live/$PREV_DOMAIN/privkey.pem"
+    echo "✓ Reusing existing Let's Encrypt certificate for $PREV_DOMAIN"
 fi
+
+# Rebuild the nginx site from the template, re-applying the domain and certificate
+deploy_nginx_site() {
+    local site="/etc/nginx/sites-available/default"
+    [ -f nginx-site-default ] || return 0
+    cp nginx-site-default "$site"
+    sed -i "s|auth_basic_user_file.*|auth_basic_user_file /etc/nginx/.htpasswd;|g" "$site"
+    sed -i "s|^\([[:space:]]*\)ssl_certificate .*|\1ssl_certificate $TLS_CERT;|" "$site"
+    sed -i "s|^\([[:space:]]*\)ssl_certificate_key .*|\1ssl_certificate_key $TLS_KEY;|" "$site"
+    if [ -n "$TLS_DOMAIN" ]; then
+        sed -i "s/server_name _;/server_name $TLS_DOMAIN;/g" "$site"
+    fi
+}
+deploy_nginx_site
 
 # Deploy logrotate config for rTorrent
 if [ -f rtorrent.logrotate ]; then
@@ -307,6 +449,7 @@ scripts=(
     "disk-maintenance.sh"
     "rtorrent-maintenance.sh"
     "monitor-php-fpm.sh"
+    "system-alerts.sh"
     "view-all-logs.sh"
 )
 
@@ -321,26 +464,32 @@ for script in "${scripts[@]}"; do
     fi
 done
 
-# Configure Cron Jobs in /etc/crontab
-if ! grep -q "monitor-php-fpm.sh" /etc/crontab; then
-    echo -e "${YELLOW}Adding Cron Jobs to /etc/crontab...${RESET}"
-    cat >> /etc/crontab << 'EOF'
+# Remove the legacy cron block older versions appended to /etc/crontab (its
+# inline disk/inode alerts never ran: cron treats '%' as a newline).
+if grep -q "^# --- Vanilla Seedbox System Maintenance Cron Jobs ---" /etc/crontab; then
+    echo -e "${YELLOW}Migrating legacy cron jobs out of /etc/crontab...${RESET}"
+    sed -i '/^# --- Vanilla Seedbox System Maintenance Cron Jobs ---$/,/oom-events\.log$/d' /etc/crontab
+fi
 
-# --- Vanilla Seedbox System Maintenance Cron Jobs ---
+# Cron jobs live in their own file so re-runs simply overwrite them.
+# Keep commands free of '%' — cron converts it to a newline.
+cat > /etc/cron.d/vsi-maintenance << 'EOF'
+# --- Vanilla Seedbox System Maintenance Cron Jobs (managed by setup.sh) ---
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 0  *    * * *   root    /usr/local/bin/monitor-php-fpm.sh
 0  4    * * *   root    /usr/local/bin/rtorrent-maintenance.sh
 0  3    * * 0   root    /usr/local/bin/disk-maintenance.sh
 
-# Daily disk usage alert if above 85%
-0  8    * * *   root    [ $(df / | awk 'NR==2 {print $5}' | sed 's/%//') -gt 85 ] && echo "$(date): Root disk usage: $(df -h / | awk 'NR==2 {print $5}')" >> /var/log/disk-alerts.log
+# Daily disk (>85%) and inode (>80%) usage alerts
+0  8    * * *   root    /usr/local/bin/system-alerts.sh usage
 
-# Alert if inode usage above 80%
-0  8    * * *   root    [ $(df -i / | awk 'NR==2 {print $5}' | sed 's/%//') -gt 80 ] && echo "$(date): Inode usage: $(df -i / | awk 'NR==2 {print $5}')" >> /var/log/inode-alerts.log
-
-# Monthly check for OOM events
-0  9    1 * *   root    grep -i "out of memory\|killed process" /var/log/syslog* 2>/dev/null >> /var/log/oom-events.log
+# Monthly check for OOM events (previous month's kernel log)
+0  9    1 * *   root    /usr/local/bin/system-alerts.sh oom
 EOF
-fi
+chmod 644 /etc/cron.d/vsi-maintenance
+echo "✓ Deployed /etc/cron.d/vsi-maintenance"
 
 # ==============================================================================
 #  7. CONFIGURE VSFTPD (FTP SERVER)
@@ -362,8 +511,8 @@ connect_from_port_20=YES
 chroot_local_user=YES
 secure_chroot_dir=/var/run/vsftpd/empty
 pam_service_name=vsftpd
-rsa_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
-rsa_private_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+rsa_cert_file=$TLS_CERT
+rsa_private_key_file=$TLS_KEY
 ssl_enable=YES
 utf8_filesystem=YES
 use_sendfile=NO
@@ -401,12 +550,18 @@ if [ -f rtorrent.service ]; then
     systemctl daemon-reload
     systemctl enable rtorrent
     
-    # Check if rtorrent is already running manually in screen before starting
-    if ! screen -list | grep -q "rtorrent"; then
+    # Only start rTorrent if the user isn't already running it (via this unit or
+    # a manual screen session — screen sessions are per-user, so check processes
+    # owned by $USERNAME rather than root's `screen -list`).
+    if systemctl is-active --quiet rtorrent; then
+        echo -e "${YELLOW}rTorrent service is already running. Run 'sudo systemctl restart rtorrent' to load the new build and config.${RESET}"
+    # Match the binary path: the process name differs between versions
+    # ('rtorrent main' up to 0.15, 'rtorrent-main' from 0.16).
+    elif pgrep -u "$USERNAME" -f '^[^ ]*/rtorrent( |$)' >/dev/null; then
+        echo -e "${YELLOW}rTorrent is already running for $USERNAME outside systemd (manual screen?). Skipping systemctl start to prevent conflicts.${RESET}"
+    else
         echo -e "${YELLOW}Starting systemd rtorrent service...${RESET}"
         systemctl start rtorrent
-    else
-        echo -e "${YELLOW}rTorrent is already running in screen. Skipping systemctl start to prevent conflicts.${RESET}"
     fi
 fi
 
@@ -419,24 +574,49 @@ systemctl restart nginx
 # ==============================================================================
 echo -e "\n${CYAN}[9/10] Configuring security & firewall (UFW / Fail2ban)...${RESET}"
 
-# A. Apply SSH Port change if it differs from active setting
-CURRENT_SSH=$(grep -E "^Port " /etc/ssh/sshd_config | awk '{print $2}' || true)
+# A. Apply SSH Port change if it differs from the active setting
+CURRENT_SSH=$(detect_ssh_port)
 if [ -n "$SSH_PORT" ] && [ "$SSH_PORT" != "$CURRENT_SSH" ]; then
-    echo -e "${YELLOW}Applying SSH Port change from '${CURRENT_SSH:-22}' to '$SSH_PORT'...${RESET}"
-    # Remove existing Port directives to avoid duplicates
-    sed -i '/^Port /d' /etc/ssh/sshd_config
-    sed -i '/^#Port /d' /etc/ssh/sshd_config
-    echo "Port $SSH_PORT" >> /etc/ssh/sshd_config
-    
+    echo -e "${YELLOW}Applying SSH Port change from '$CURRENT_SSH' to '$SSH_PORT'...${RESET}"
+
+    # Open the new port in an already-active UFW BEFORE sshd moves, so new
+    # sessions aren't locked out even if the UFW prompt below is declined.
+    if ufw_active; then
+        ufw allow "$SSH_PORT"/tcp comment 'SSH'
+        echo "✓ Allowed new SSH port $SSH_PORT in the active UFW firewall."
+    fi
+
+    # Multiple Port lines make sshd listen on all of them, so comment out every
+    # other Port directive and keep the single setting in a dedicated drop-in.
+    sed -i 's/^Port /#Port /' /etc/ssh/sshd_config
+    grep -l -E "^[[:space:]]*Port " /etc/ssh/sshd_config.d/*.conf 2>/dev/null | grep -v "00-vsi-port.conf" | while read -r f; do
+        sed -i 's/^\([[:space:]]*\)Port /\1#Port /' "$f"
+    done || true
+    echo "Port $SSH_PORT" > /etc/ssh/sshd_config.d/00-vsi-port.conf
+
+    if ! sshd -t; then
+        echo -e "${RED}sshd config test failed — reverting SSH port change, staying on $CURRENT_SSH.${RESET}"
+        echo "Port $CURRENT_SSH" > /etc/ssh/sshd_config.d/00-vsi-port.conf
+        SSH_PORT="$CURRENT_SSH"
+    fi
+
     # Reload systemd generator and restart SSH services (non-disruptive for current shell)
     systemctl daemon-reload
     systemctl restart ssh.socket ssh.service || systemctl restart sshd || true
-    echo -e "${GREEN}✓ SSH Port successfully configured to $SSH_PORT.${RESET}"
-    echo -e "${YELLOW}Note: Your current SSH connection will remain active, but you must use port $SSH_PORT for all new logins!${RESET}"
+    echo -e "${GREEN}✓ SSH Port configured to $SSH_PORT.${RESET}"
+    echo -e "${YELLOW}Note: Keep this session open and test a NEW login on port $SSH_PORT before disconnecting!${RESET}"
 fi
+save_state
 
 read -p "Do you want to configure and enable UFW firewall? [Y/n]: " CONFIRM_UFW
 CONFIRM_UFW=${CONFIRM_UFW:-Y}
+
+if ! [[ "$CONFIRM_UFW" =~ ^[Yy]$ ]] && ufw_active; then
+    # UFW is already enforcing rules; make sure the current SSH/FTP ports are reachable
+    echo -e "${YELLOW}UFW is already active — ensuring SSH ($SSH_PORT) and FTP ($FTP_PORT) ports are allowed...${RESET}"
+    ufw allow "$SSH_PORT"/tcp comment 'SSH'
+    ufw allow "$FTP_PORT"/tcp comment 'FTP Control'
+fi
 
 if [[ "$CONFIRM_UFW" =~ ^[Yy]$ ]]; then
     echo "SSH Port to allow in firewall: $SSH_PORT"
@@ -462,12 +642,22 @@ fi
 echo -e "${YELLOW}Installing and configuring Fail2ban...${RESET}"
 apt-get install -y fail2ban
 
+# Ban through UFW only when UFW is actually enforcing; otherwise use nftables
+# directly so bans still take effect with UFW declined/disabled.
+if ufw_active; then
+    F2B_BANACTION="ufw"
+else
+    F2B_BANACTION="nftables-multiport"
+    command -v nft >/dev/null 2>&1 || apt-get install -y nftables
+fi
+echo "Fail2ban ban action: $F2B_BANACTION"
+
 cat << EOF > /etc/fail2ban/jail.local
 [DEFAULT]
 bantime = 10m
 findtime = 10m
 maxretry = 5
-banaction = ufw
+banaction = $F2B_BANACTION
 
 [sshd]
 enabled = true
@@ -495,7 +685,13 @@ echo "✓ Fail2ban configured and enabled successfully."
 #  10. CONFIGURE DOMAIN NAME & LET'S ENCRYPT (SSL/TLS)
 # ==============================================================================
 echo -e "\n${CYAN}[10/10] Configure Domain Name & Let's Encrypt (SSL/TLS)...${RESET}"
-read -p "Do you want to configure a custom domain and install Let's Encrypt SSL/TLS certificates? [y/N]: " CONFIRM_SSL
+if [ -n "$TLS_DOMAIN" ]; then
+    # Stage 5/7 already re-applied the existing certificate to nginx and vsftpd
+    echo -e "${GREEN}✓ Let's Encrypt is already configured for $TLS_DOMAIN (nginx + vsftpd).${RESET}"
+    read -p "Configure a different domain/certificate? [y/N]: " CONFIRM_SSL
+else
+    read -p "Do you want to configure a custom domain and install Let's Encrypt SSL/TLS certificates? [y/N]: " CONFIRM_SSL
+fi
 CONFIRM_SSL=${CONFIRM_SSL:-N}
 
 if [[ "$CONFIRM_SSL" =~ ^[Yy]$ ]]; then
@@ -506,11 +702,12 @@ if [[ "$CONFIRM_SSL" =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}Installing Certbot Nginx plugin...${RESET}"
         apt-get install -y certbot python3-certbot-nginx
         
-        # Update Nginx site configuration server_name
-        NGINX_DEFAULT="/etc/nginx/sites-available/default"
-        if [ -f "$NGINX_DEFAULT" ]; then
+        # Update Nginx site configuration server_name (rebuilt from the template
+        # so a previously configured domain is replaced cleanly)
+        if [ -f nginx-site-default ]; then
             echo "✓ Updating server_name to $DOMAIN_NAME in Nginx site default..."
-            sed -i "s/server_name _;/server_name $DOMAIN_NAME;/g" "$NGINX_DEFAULT"
+            TLS_DOMAIN="$DOMAIN_NAME"
+            deploy_nginx_site
             systemctl reload nginx
         fi
         
@@ -527,6 +724,9 @@ if [[ "$CONFIRM_SSL" =~ ^[Yy]$ ]]; then
                 sed -i "s|^rsa_private_key_file=.*|rsa_private_key_file=/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem|" /etc/vsftpd.conf
                 systemctl restart vsftpd || true
             fi
+
+            # Remember the domain so re-runs keep this certificate in place
+            save_state
         else
             echo -e "${RED}Warning: Certbot SSL/TLS certificate request failed.${RESET}"
             echo -e "${YELLOW}Please verify your DNS settings and run 'sudo certbot --nginx' manually later.${RESET}"

@@ -13,9 +13,10 @@ if [ -n "$SESSION_DIR" ]; then
     echo "Session directory size: $(du -sh $SESSION_DIR 2>/dev/null | awk '{print $1}')" >> $LOGFILE
 fi
 
-# Check for hung rtorrent processes
-RTORRENT_PROCS=$(pgrep -c rtorrent)
-echo "Active rtorrent processes: $RTORRENT_PROCS" >> $LOGFILE
+# Check for hung rtorrent processes (-x: exact name, so this script itself
+# isn't counted; pgrep prints 0 on no match, just exits non-zero)
+RTORRENT_PROCS=$(pgrep -cx rtorrent)
+echo "Active rtorrent processes: ${RTORRENT_PROCS:-0}" >> $LOGFILE
 
 # Check inode usage (important for many small torrent files)
 echo "Inode usage:" >> $LOGFILE

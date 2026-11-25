@@ -1,0 +1,3 @@
+# Everything here runs on Linux (shell scripts, rc/ini/nginx configs, systemd units).
+# Keep LF in Windows checkouts too, so files copied straight from a working copy work.
+* text=auto eol=lf

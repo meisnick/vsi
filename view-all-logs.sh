@@ -24,23 +24,23 @@ display_log_with_errors() {
         case "$log_type" in
             nginx_access)
                 # For access logs, only count HTTP error status codes (4xx, 5xx)
-                ERROR_COUNT=$(tail -n 100 "$log_file" | grep -Ec '\" [45][0-9]{2} ' 2>/dev/null || echo "0")
+                ERROR_COUNT=$(tail -n 100 "$log_file" | grep -Ec '\" [45][0-9]{2} ')
                 WARN_COUNT=0
                 ;;
             nginx_error)
                 # For nginx error logs, only count actual error levels (not URLs containing "error")
-                ERROR_COUNT=$(grep -Ec '\[(emerg|alert|crit|error)\]' "$log_file" 2>/dev/null || echo "0")
-                WARN_COUNT=$(grep -Ec '\[warn\]' "$log_file" 2>/dev/null || echo "0")
+                ERROR_COUNT=$(grep -Ec '\[(emerg|alert|crit|error)\]' "$log_file" 2>/dev/null)
+                WARN_COUNT=$(grep -Ec '\[warn\]' "$log_file" 2>/dev/null)
                 ;;
             php_fpm)
-                # For PHP-FPM, exclude NOTICE level messages
-                ERROR_COUNT=$(grep -Evc 'NOTICE:' "$log_file" | xargs -I {} grep -Eic 'ERROR:|CRITICAL:|ALERT:|EMERGENCY:' "$log_file" 2>/dev/null || echo "0")
-                WARN_COUNT=$(grep -ic 'WARNING:' "$log_file" 2>/dev/null || echo "0")
+                # For PHP-FPM, count only error-level entries (NOTICE lines never match)
+                ERROR_COUNT=$(grep -Eic 'ERROR:|CRITICAL:|ALERT:|EMERGENCY:' "$log_file" 2>/dev/null)
+                WARN_COUNT=$(grep -ic 'WARNING:' "$log_file" 2>/dev/null)
                 ;;
             *)
                 # Generic: avoid counting "error" in URLs, paths, or normal messages
-                ERROR_COUNT=$(grep -Eic '\b(error|critical|fail(ed)?)\b' "$log_file" 2>/dev/null || echo "0")
-                WARN_COUNT=$(grep -Eic '\bwarning\b' "$log_file" 2>/dev/null || echo "0")
+                ERROR_COUNT=$(grep -Eic '\b(error|critical|fail(ed)?)\b' "$log_file" 2>/dev/null)
+                WARN_COUNT=$(grep -Eic '\bwarning\b' "$log_file" 2>/dev/null)
                 ;;
         esac
 
@@ -106,15 +106,18 @@ echo ""
 
 # rTorrent
 echo -e "${CYAN}=== rTorrent ===${RESET}"
-RTORRENT_COUNT=$(pgrep -c rtorrent 2>/dev/null || echo 0)
+# -x: exact process name (don't count rtorrent-maintenance.sh etc.); pgrep
+# already prints 0 when nothing matches, so no "|| echo 0" fallback.
+RTORRENT_COUNT=$(pgrep -cx rtorrent 2>/dev/null)
+RTORRENT_COUNT=${RTORRENT_COUNT:-0}
 echo "Processes: $RTORRENT_COUNT"
 if [ "$RTORRENT_COUNT" -gt 0 ]; then
-    ps aux | grep "[r]torrent" | awk '{print "PID: " $2 " | CPU: " $3 "% | MEM: " $4 "% | Runtime: " $10}'
+    ps -C rtorrent -o pid=,pcpu=,pmem=,etime=,user= | awk '{print "PID: " $1 " | CPU: " $2 "% | MEM: " $3 "% | Runtime: " $4 " | User: " $5}'
 
-    # Check screen session
-    SCREEN_SESSION=$(screen -ls 2>/dev/null | grep rtorrent | awk '{print $1}')
+    # Check screen session (screen -ls is per-user, so look at processes instead)
+    SCREEN_SESSION=$(ps -C screen -o user=,args= | awk '/S rtorrent/ {print $1}' | head -n1)
     if [ -n "$SCREEN_SESSION" ]; then
-        echo "Screen session: $SCREEN_SESSION"
+        echo "Screen session: rtorrent (owner: $SCREEN_SESSION — log in as $SCREEN_SESSION and run: screen -r rtorrent)"
     fi
 fi
 display_log_with_errors "rTorrent Execute Log" "/var/log/rtorrent/execute.log" 30 "generic"

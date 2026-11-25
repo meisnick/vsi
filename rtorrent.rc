@@ -35,11 +35,12 @@ throttle.min_peers.seed.set = -1
 throttle.max_peers.seed.set = -1
 
 ### Networking
-network.port_range.set = 51001-51250
-network.port_random.set = yes
+network.listen.port.range.set = 51001-51250
+network.listen.port.random.set = yes
+# DHT defaults to "auto" since 0.16.14; keep it off (private trackers forbid it)
 dht.mode.set = disable
 protocol.pex.set = no
-trackers.use_udp.set = yes
+# UDP trackers are always enabled since 0.16.12 (trackers.use_udp was removed)
 
 # SCGI over a filesystem socket — no TCP surface (prevents unauthenticated
 # local XMLRPC/RCE). nginx/PHP run as www-data, which setup.sh adds to the
@@ -50,9 +51,9 @@ schedule = scgi_perm,0,0,"execute.nothrow=chmod,\"g+w,o=\",(cat,(cfg.basedir),\"
 network.http.ssl_verify_peer.set = 1
 protocol.encryption.set = allow_incoming,enable_retry,prefer_plaintext
 
-network.max_open_files.set = 10240
-network.max_open_sockets.set = 1536
-network.http.max_open.set = 48
+# Since 0.16.15 sockets are budgeted per category (system.sockets.<category>.*);
+# network.max_open_files / network.http.max_open are no-ops and were removed.
+system.sockets.max_size.set = 1536
 network.send_buffer.size.set = 4M
 network.receive_buffer.size.set = 4M
 
@@ -75,7 +76,7 @@ execute = {sh,-c,/usr/bin/php /var/www/rutorrent/php/initplugins.php __USERNAME_
 
 ### Anti-Corruption Settings
 # Save session every 20 minutes to prevent session corruption
-schedule2 = session_save, 1200, 1200, ((session.save))
+schedule = session_save, 1200, 1200, ((session.save))
 # Preallocate files to reduce fragmentation
 system.file.allocate.set = yes
 # Disable file splitting (simpler, more reliable)
